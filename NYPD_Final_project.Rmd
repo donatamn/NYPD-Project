@@ -1,0 +1,293 @@
+---
+title: "NYPD_Final_Project"
+author: "Damlanur Onat"
+date: "2025-10-02"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+# NYPD Final Project
+
+```{r}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+library(tidyverse)  
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+set.seed(42)
+```
+
+## Step 1 — Import raw data
+
+```{r}
+source_url <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+
+raw <- readr::read_csv(source_url, show_col_types = FALSE)
+
+#Let's see what the data looks like
+cat("Rows:", nrow(raw), "  Cols:", ncol(raw), "\n\nFirst 25 column names:\n")
+print(head(names(raw), 25))
+cat("\nPreview:\n")
+print(utils::head(raw, 5))
+cat("\nStructure glimpse (first 200 rows):\n")
+dplyr::glimpse(utils::head(raw, 200))
+```
+
+##Step 2 — Tidy / Transform the data
+
+```{r}
+# Map the Shooting Incident (Historic) columns to a tidy analysis table
+
+shootings <- raw %>%
+  transmute(
+    incident_key  = as.character(INCIDENT_KEY),
+    incident_date = mdy(OCCUR_DATE),                 # OCCUR_DATE is MM/DD/YYYY
+    borough       = stringr::str_to_title(BORO),     # "BROOKLYN" -> "Brooklyn"
+    precinct      = as.integer(PRECINCT)
+  ) %>%
+  mutate(
+    year         = year(incident_date),
+    month        = floor_date(incident_date, "month"),
+    weekday      = wday(incident_date, label = TRUE, week_start = 1),
+    weekend      = weekday %in% c("Sat", "Sun"),
+    combined_key = paste(borough, precinct, incident_date, sep = "::")
+  )
+
+# Quickly see what it looks like
+
+cat("N missing dates after parsing:", sum(is.na(shootings$incident_date)), "\n")
+stopifnot(!all(is.na(shootings$incident_date)))
+glimpse(shootings)
+
+```
+
+\*\*Step 3 — Simple aggregations & comparisons
+
+```{r}
+# One row per incident
+shootings_unique <- shootings %>% distinct(incident_key, .keep_all = TRUE)
+
+# Citywide daily counts (used later by the model, too)
+city_daily <- shootings_unique %>%
+  count(incident_date, name = "n") %>%
+  arrange(incident_date)
+
+head(city_daily, 10)
+
+```
+
+```{r}
+# Borough comparison (counts)
+bor_counts <- shootings_unique %>%
+  count(borough, name = "n") %>%
+  arrange(desc(n))
+
+bor_counts
+
+ggplot(bor_counts, aes(x = reorder(borough, n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Incidents by Borough (counts)",
+       x = NULL, y = "Incidents") +
+  theme_minimal(base_size = 12)
+
+
+```
+
+```{r}
+# Day-of-week comparison (counts)
+dow_counts <- shootings_unique %>%
+  mutate(weekday = wday(incident_date, label = TRUE, week_start = 1)) %>%
+  count(weekday, name = "n")
+
+dow_counts
+
+ggplot(dow_counts, aes(x = weekday, y = n)) +
+  geom_col() +
+  labs(title = "Incidents by Day of Week (counts)",
+       x = NULL, y = "Incidents") +
+  theme_minimal(base_size = 12)
+
+```
+
+```{r}
+# Top 10 precincts (counts)
+top_precincts <- shootings_unique %>%
+  filter(!is.na(precinct)) %>%
+  count(precinct, name = "n") %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 10)
+
+top_precincts
+
+ggplot(top_precincts, aes(x = reorder(as.factor(precinct), n), y = n)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = "Top 10 Precincts by Incidents (counts)",
+       x = "Precinct", y = "Incidents") +
+  theme_minimal(base_size = 12)
+
+```
+
+```{r}
+# Overall Male vs Female victims 
+mf_overall <- raw %>%
+  transmute(vic_sex = VIC_SEX) %>%
+  filter(vic_sex %in% c("M","F")) %>%
+  mutate(vic_sex = ifelse(vic_sex == "M", "Male", "Female")) %>%
+  count(vic_sex, name = "n") %>%
+  mutate(pct = n / sum(n),
+         pct_label = paste0(round(pct*100, 1), "%"))
+
+mf_overall
+
+ggplot(mf_overall, aes(x = vic_sex, y = n)) +
+  geom_col() +
+  geom_text(aes(label = pct_label), vjust = -0.4) +
+  labs(title = "Victims by Sex — Overall (counts)",
+       x = NULL, y = "Victims") +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "none")
+
+```
+
+\*\*Step 4 — Simple model (difference in means)
+
+```{r}
+# Build small modeling frame with a weekend flag
+simple_df <- city_daily %>%
+  mutate(
+    weekday = wday(incident_date, label = TRUE, week_start = 1),
+    weekend = weekday %in% c("Sat", "Sun")
+  )
+
+# Linear regression: n ~ weekend  
+m_simple <- lm(n ~ weekend, data = simple_df)
+
+# Lets see Summary
+summary(m_simple)
+
+# Group means & a 95% CI for the weekend difference
+grp_means <- simple_df %>%
+  group_by(weekend) %>%
+  summarise(avg = mean(n, na.rm = TRUE),
+            sd = sd(n, na.rm = TRUE),
+            days = n(), .groups = "drop")
+
+weekday_mean <- grp_means$avg[grp_means$weekend == FALSE]
+weekend_mean <- grp_means$avg[grp_means$weekend == TRUE]
+diff_mean    <- weekend_mean - weekday_mean
+ci           <- confint(m_simple)["weekendTRUE", ]
+
+cat(paste0(
+  "Weekday mean: ", round(weekday_mean, 2),
+  " | Weekend mean: ", round(weekend_mean, 2),
+  " | Difference (weekend - weekday): ", round(diff_mean, 2),
+  "\n95% CI for difference: [", round(ci[1], 2), ", ", round(ci[2], 2), "]\n"
+))
+
+```
+
+```{r}
+# Observed vs “fitted” two-level means
+simple_df <- simple_df %>% mutate(pred = predict(m_simple))
+
+simple_df %>%
+  ggplot(aes(x = incident_date)) +
+  geom_point(aes(y = n, color = "Observed"), alpha = 0.6, size = 1.5) +
+  geom_line(aes(y = pred, color = "Fitted"), size = 0.9) +
+  scale_color_manual(values = c("Observed" = "#2C7FB8", "Fitted" = "#D95F0E"), name = NULL) +
+  labs(
+    title = "Observed vs Fitted (Simple Weekend vs Weekday Model)",
+    subtitle = "lm(n ~ weekend)",
+    x = NULL, y = "Incidents per day"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+```
+
+##### Right now, we are not able to compare weekday and weekend expectations clearly, it just looks like a straight orange line. Lets check the results for last year:
+
+```{r}
+
+
+
+stopifnot(inherits(simple_df$incident_date, "Date"))   
+
+end_date   <- max(simple_df$incident_date, na.rm = TRUE)
+start_date <- end_date - days(364)
+
+last_year_df <- simple_df %>%
+  filter(incident_date >= start_date, incident_date <= end_date)
+
+cat("Rows in last_year_df:", nrow(last_year_df), "\n")
+stopifnot(nrow(last_year_df) > 0)   
+
+# Fit the model on this window ---
+m_last_year <- lm(n ~ weekend, data = last_year_df)
+
+# Predictions for plotting ---
+last_year_df <- last_year_df %>% mutate(pred = predict(m_last_year))
+
+# Build the plot object, then PRINT it ---
+p <- ggplot(last_year_df, aes(x = incident_date)) +
+  geom_point(aes(y = n, color = "Observed"), alpha = 0.6, size = 1.5) +
+  geom_line(aes(y = pred, color = "Fitted"), linewidth = 0.9) +
+  scale_color_manual(values = c("Observed" = "#2C7FB8", "Fitted" = "#D95F0E"), name = NULL) +
+  labs(
+    title = "Observed vs Fitted (Last 365 Days)",
+    subtitle = "Model: lm(n ~ weekend)",
+    x = NULL, y = "Incidents per day"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "top")
+
+print(p)   
+
+
+```
+
+##### Here we can see weekday and weekend difference on the orange line. As we also see, this prediction does not help us to predict future incidents. 
+
+\*\*Step 5 — Story, bias & reproducibility
+
+```{r}
+# Core numbers for the short narrative
+total_incidents <- nrow(shootings_unique)
+start_date <- min(city_daily$incident_date, na.rm = TRUE)
+end_date   <- max(city_daily$incident_date, na.rm = TRUE)
+
+weekday_mean <- mean(simple_df$n[!simple_df$weekend], na.rm = TRUE)
+weekend_mean <- mean(simple_df$n[ simple_df$weekend], na.rm = TRUE)
+diff_mean    <- weekend_mean - weekday_mean
+
+# Victim sex shares (already computed above as mf_overall)
+male_pct   <- round(100 * mf_overall$pct[mf_overall$vic_sex == "Male"], 1)
+female_pct <- round(100 * mf_overall$pct[mf_overall$vic_sex == "Female"], 1)
+
+```
+
+```{r}
+sessionInfo()
+
+```
+
+Biases & Limitations
+
+Measurement/coverage: Not every shooting may be reported or recorded consistently; recent dates may be revised.
+
+Case definition: Counts reflect NYPD classification rules; reclassification can shift totals.
+
+Date choice: I used occur date; using report date would change timing.
+
+Duplication: I analyzed incidents (by incident_key), not victims; victim-level analysis yields different totals.
+
+Aggregation: Borough summaries hide neighborhood/precinct variation.
+
+Simple model limits: The weekend-vs-weekday model is descriptive; it omits weather, policy shifts, and time dependence.
+
+Missing values: Rows with unknown victim sex were excluded from the M/F comparison, which can bias shares.
+
+Personal bias reflection: I expected higher activity on summer weekends and in some boroughs. To reduce bias, I reported full citywide trends, used consistent rules for comparisons, and showed both overall and dis aggregated views.
